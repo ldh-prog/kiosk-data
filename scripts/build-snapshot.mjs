@@ -12,6 +12,9 @@
  *   PAGES_BASE_URL          직전 배포본 주소. 제증명 이월과 건수 하한 비교에 쓴다.
  *   REFRESH_CERTIFICATES    "true"면 요일과 관계없이 제증명을 다시 받는다.
  *   CERT_MAX_PAGES          로컬 시험용. 제증명을 이 쪽수까지만 받는다. 배포용 아님.
+ *   JUSO_SEARCH_KEY         도로명주소 검색 API 승인키. 좌표 키와 둘 다 있어야 새 발급기 좌표를 찾는다.
+ *   JUSO_COORD_KEY          도로명주소 좌표제공 API 승인키. 없으면 직전 배포본 좌표만 이월한다.
+ *   GEOCODE_MAX             한 번에 새로 찾을 발급기 수 상한(기본 제한 없음).
  *   OUT_DIR                 기본 site
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -32,6 +35,8 @@ import {
   localGovToSido,
   normalizeServiceKey
 } from "./snapshot-lib.mjs";
+import { buildPointsFile } from "./geo.mjs";
+import { attachCoordinates, createJusoClient, previousCoordinates } from "./geocode.mjs";
 
 const serviceKey = normalizeServiceKey(process.env.DATA_GO_KR_SERVICE_KEY);
 const outDir = resolve(process.env.OUT_DIR || "site");
@@ -39,10 +44,20 @@ const pagesBaseUrl = (process.env.PAGES_BASE_URL || "").replace(/\/+$/, "");
 const forceCertificateRefresh = process.env.REFRESH_CERTIFICATES === "true";
 const certMaxPages = Number(process.env.CERT_MAX_PAGES || 0);
 const concurrency = Math.max(1, Number(process.env.CONCURRENCY || 4));
+const jusoSearchKey = (process.env.JUSO_SEARCH_KEY || "").trim();
+const jusoCoordKey = (process.env.JUSO_COORD_KEY || "").trim();
+const geocodeMax = process.env.GEOCODE_MAX ? Number(process.env.GEOCODE_MAX) : Infinity;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 4;
 
 class FatalApiError extends Error {}
+
+/**
+ * 직전 배포본을 네트워크 문제로 못 읽었다. ‘없음(404)’과 달리 이번 실행을 접는다.
+ * 첫 실행처럼 처리하면 제증명 전체(약 5,100회)와 좌표 전체를 다시 받게 된다.
+ * (2026-10-07 03:00 맥이 배터리 다크 웨이크 중 다시 잠들어 DNS가 끊긴 일이 있었다.)
+ */
+class PreviousUnavailableError extends Error {}
 
 function log(message) {
   console.log(message);
@@ -171,19 +186,30 @@ function writeText(relativePath, text) {
   writeFileSync(file, text, "utf8");
 }
 
+/** 직전 배포본 파일. 없으면(404) null, 네트워크·서버 오류가 이어지면 PreviousUnavailableError. */
 async function fetchPrevious(relativePath) {
   if (!pagesBaseUrl) {
     return null;
   }
-  try {
-    const response = await fetch(`${pagesBaseUrl}/${relativePath}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    if (!response.ok) {
-      return null;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(`${pagesBaseUrl}/${relativePath}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return await response.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await sleep(3000 * attempt);
+      }
     }
-    return await response.text();
-  } catch {
-    return null;
   }
+  throw new PreviousUnavailableError(`직전 배포본 ${relativePath} 을 읽지 못했습니다: ${describe(lastError)}`);
 }
 
 async function loadPreviousMeta() {
@@ -205,6 +231,7 @@ async function buildKiosks(previousMeta, generatedAt) {
   // 원본에 완전히 같은 행이 50건쯤 있다(2026-10). 건수 확인은 중복 제거 전에 한다.
   assertComplete("설치정보", result.rows.length, result.totalCount);
   const rows = dedupe(result.rows, (row) => kioskKey(row?.OPN_ATMY_GRP_CD, row?.MNG_NO));
+  const geo = await buildCoordinates(rows, previousMeta, generatedAt);
 
   const { bySido, dropped } = groupKiosksBySido(rows);
   const count = [...bySido.values()].reduce((sum, list) => sum + list.length, 0);
@@ -215,8 +242,43 @@ async function buildKiosks(previousMeta, generatedAt) {
     writeJson(`v1/kiosks/${sidoCode}.json`, { schema: SCHEMA_VERSION, generatedAt, sidoCode, count: items.length, items });
     sidos[sidoCode] = items.length;
   }
+  writeJson("v1/points.json", buildPointsFile(bySido, generatedAt, SCHEMA_VERSION));
   log(`설치정보 ${count}건 (${Object.keys(sidos).length}개 시도, 중복 ${result.rows.length - rows.length}건·버린 행 ${dropped}건 제외, API ${result.pages}회)`);
-  return { rows, meta: { generatedAt, count, dropped, sidos } };
+  return { rows, meta: { generatedAt, count, dropped, sidos }, geo };
+}
+
+/** 직전 배포본의 설치정보 파일들. 좌표 이월에 쓴다. */
+async function loadPreviousKioskItems(previousMeta) {
+  const items = [];
+  for (const sidoCode of Object.keys(previousMeta?.kiosks?.sidos ?? {})) {
+    const text = await fetchPrevious(`v1/kiosks/${sidoCode}.json`);
+    try {
+      items.push(...(JSON.parse(text ?? "null")?.items ?? []));
+    } catch {
+      // 형식이 깨진 시도는 좌표를 새로 찾는다. 네트워크 오류는 fetchPrevious가 실행을 접는다.
+    }
+  }
+  return items;
+}
+
+async function buildCoordinates(rows, previousMeta, generatedAt) {
+  const previous = previousCoordinates(await loadPreviousKioskItems(previousMeta));
+  const client = jusoSearchKey && jusoCoordKey ? createJusoClient({ searchKey: jusoSearchKey, coordKey: jusoCoordKey }) : null;
+  if (!client) {
+    log("좌표: 도로명주소 API 키가 없어 직전 배포본 좌표만 이월합니다.");
+  }
+  const stats = await attachCoordinates(rows, previous, { client, maxLookups: geocodeMax, log });
+  if (stats.fatal) {
+    warn(`좌표 찾기 중단(키 확인): ${stats.fatal}`);
+  }
+  const withCoordinates = rows.filter((row) => Number.isFinite(row.GEO_LAT)).length;
+  log(`좌표 ${withCoordinates}/${rows.length}곳 (이월 ${stats.reused}, 새로 ${stats.geocoded}, 실패 ${stats.failed}, 미처리 ${stats.skipped})`);
+  return {
+    source: "행정안전부 도로명주소 좌표제공 API(주출입구)",
+    generatedAt,
+    withCoordinates,
+    ...stats
+  };
 }
 
 function clearCertificates() {
@@ -270,6 +332,9 @@ async function buildCertificates(installationRows, previousMeta, generatedAt) {
     try {
       return await carryOverCertificates(previousMeta);
     } catch (error) {
+      if (error instanceof PreviousUnavailableError) {
+        throw error;
+      }
       warn(`제증명 이월 실패, 새로 받습니다: ${describe(error)}`);
     }
   }
@@ -300,6 +365,7 @@ function indexHtml(meta) {
     <h1>무인민원발급기 데이터 스냅샷</h1>
     <p>「무인민원발급기 찾기」 앱(kr.ulsan.ldh.kiosk)이 읽는 정적 파일입니다. 하루 1회 갱신합니다.</p>
     <p>출처: 행정안전부, 공공데이터포털 <a href="https://www.data.go.kr/data/15154774/openapi.do">무인민원발급기정보 조회서비스</a>. 원본은 매일 갱신되며 2일 전 데이터까지 반영됩니다. 방문 전 현장을 확인하세요.</p>
+    <p>좌표: 행정안전부 도로명주소 좌표제공 API(건물 주출입구 기준) · 좌표 있는 발급기 ${meta.geo.withCoordinates}/${meta.kiosks.count}곳 · <a href="v1/points.json">v1/points.json</a></p>
     <p>생성: <code>${meta.generatedAt}</code> · 설치정보 ${meta.kiosks.count}건 · 발급 서류 기준 <code>${meta.certificates.generatedAt}</code></p>
     <p><a href="v1/meta.json">v1/meta.json</a></p>
     <ul>
@@ -329,6 +395,7 @@ async function main() {
     generatedAt,
     source: "https://www.data.go.kr/data/15154774/openapi.do",
     kiosks: kiosks.meta,
+    geo: kiosks.geo,
     certificates
   };
   writeJson("v1/meta.json", meta);

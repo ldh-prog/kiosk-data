@@ -38,7 +38,10 @@ export const INSTALLATION_FIELDS = [
   "RG_MTTR_PRDOC_ISSU_SE",
   "FAM_REL_DEL_ISSU_SE",
   "DAT_UPDT_PNT",
-  "LAST_MDFCN_PNT"
+  "LAST_MDFCN_PNT",
+  // 원본 API 필드가 아니다. 도로명주소 좌표제공 API로 붙인 주출입구 WGS84 좌표(geocode.mjs).
+  "GEO_LAT",
+  "GEO_LON"
 ];
 
 /** Encoding 키(%2F 등)를 넣어도 한 번만 디코딩한다. URLSearchParams 가 다시 인코딩한다. */

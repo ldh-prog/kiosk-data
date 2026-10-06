@@ -24,6 +24,13 @@ if ! security find-generic-password -s "$LABEL" -a DATA_GO_KR_SERVICE_KEY >/dev/
 fi
 
 mkdir -p "${PLIST:h}" "${LOG:h}"
+# 하루 여러 시간대에 부르고, 스크립트가 오늘 배포본이 있으면 건너뛴다. 맥이 잠깐 깨었다 다시 잠들어 한 번 실패해도 다음 시간대에 채운다.
+HOURS=(3 9 12 15 18 21)
+INTERVALS=""
+for hour in $HOURS; do
+  INTERVALS+="    <dict><key>Hour</key><integer>$hour</integer><key>Minute</key><integer>0</integer></dict>
+"
+done
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,12 +46,8 @@ cat > "$PLIST" <<EOF
     <string>$RUN_DIR/scripts/publish-local.sh</string>
   </array>
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>3</integer>
-    <key>Minute</key>
-    <integer>0</integer>
-  </dict>
+  <array>
+$INTERVALS  </array>
   <key>StandardOutPath</key>
   <string>$LOG</string>
   <key>StandardErrorPath</key>
@@ -57,6 +60,6 @@ EOF
 
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$PLIST"
-print "설치 완료: 매일 03:00 (잠자기 중이면 깨어난 직후)"
+print "설치 완료: 매일 ${(j:·:)HOURS}시 (잠자기 중이면 깨어난 직후). 오늘 배포본이 있으면 건너뜀"
 print "지금 한 번 실행: launchctl kickstart gui/$UID/$LABEL"
 print "로그: $LOG"
