@@ -1,0 +1,21 @@
+name: test
+
+# 스냅샷 생성은 GitHub 러너에서 하지 않는다. 러너(미국)에서는 apis.data.go.kr 연결이 막혀 있다.
+# 생성·배포는 scripts/publish-local.sh 가 국내 맥에서 한다. 여기서는 순수 함수 테스트만 돌린다.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm test
