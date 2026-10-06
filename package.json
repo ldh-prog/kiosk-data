@@ -1,0 +1,14 @@
+{
+  "name": "kr.ulsan.ldh.kiosk-data",
+  "version": "1.0.0",
+  "private": true,
+  "description": "무인민원발급기 찾기 앱이 읽는 공공데이터 스냅샷",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "build": "node scripts/build-snapshot.mjs"
+  }
+}

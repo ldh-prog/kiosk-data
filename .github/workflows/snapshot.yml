@@ -1,0 +1,63 @@
+name: snapshot
+
+on:
+  schedule:
+    # 매일 03:00 KST. 일요일에는 발급 서류 목록도 다시 받는다(스크립트가 판단).
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      refresh_certificates:
+        description: "발급 서류 목록도 전부 다시 받기 (API 약 5,100회)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm test
+      - name: Build snapshot
+        env:
+          DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
+          REFRESH_CERTIFICATES: ${{ inputs.refresh_certificates || false }}
+          PAGES_BASE_URL: https://ldh-prog.github.io/kiosk-data
+        run: node scripts/build-snapshot.mjs
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  keepalive:
+    # 공개 저장소의 예약 워크플로는 60일 동안 저장소 활동이 없으면 꺼진다. 실행할 때마다 다시 켠다.
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/snapshot.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
