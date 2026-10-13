@@ -102,26 +102,66 @@ export function roadKeyString(key) {
 
 /**
  * 검색 API 키워드. ‘울산광역시 남구 돋질로92번길 28, 달동주민센터 (달동)’ → ‘울산광역시 남구 돋질로92번길 28’.
- * 검색 API는 특수문자가 있으면 오류를 내므로 한글·영숫자·공백·하이픈만 남긴다.
+ *
+ * - 원본 주소의 약 18%는 뒤에 ‘[지번주소 건물명]’이 붙는다. 이것이 검색어에 섞이면 결과가 0건이라
+ *   (2026-10-12 좌표 실패 966곳 중 862곳) 소괄호처럼 대괄호도 통째로 뺀다.
+ * - 괄호 안에 쉼표가 있을 수 있어(‘(백석동, ○○아파트)’) 괄호를 먼저 빼고 쉼표로 자른다.
+ * - 검색 API는 특수문자가 있으면 오류를 내므로 한글·영숫자·공백·하이픈·점만 남긴다.
+ *   점은 ‘3.1만세로’, ‘4.4만세로’ 같은 도로명에 있어 남긴다(‘4 4만세로’는 0건).
  */
 export function searchKeyword(address) {
   return String(address ?? "")
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+    .replace(/[([].*$/, " ")
     .split(",")[0]
-    .replace(/\([^)]*\)/g, " ")
-    .replace(/[^가-힣A-Za-z0-9\s-]/g, " ")
+    .replace(/[^가-힣A-Za-z0-9.\s-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-/** 검색 결과 중 도로명코드·건물번호가 정확히 같은 주소만 고른다. 지하여부만 다르면 허용한다. */
-export function pickExactAddress(results, key) {
-  const same = (item) =>
-    digits(item?.rnMgtSn) === key.rnMgtSn
-    && String(Number(digits(item?.buldMnnm))) === key.buldMnnm
+/**
+ * 시도 + 도로명 + 건물번호만 남긴 검색어. ‘인천광역시 중구 운남서로 100’ → ‘인천광역시 운남서로 100’.
+ * 원본 주소에 개편 전 시군구·읍면 이름이 남아 있으면(인천 중구 → 영종구, 경기 광주시 오포읍 → 동 전환,
+ * 대구 달성군 현풍면 → 현풍읍) 검색이 0건이라, 처음 검색어로 같은 건물을 못 찾으면 이것으로 다시 찾는다.
+ * 도로명 + 건물번호 형태로 끝나지 않으면 빈 문자열.
+ */
+export function roadOnlyKeyword(keyword) {
+  const match = String(keyword ?? "").match(/^(\S+)\s.*?(\S+\s(?:지하\s)?\d+(?:-\d+)?)$/);
+  return match ? `${match[1]} ${match[2]}` : "";
+}
+
+/**
+ * 검색 결과 중 발급기와 같은 건물을 고른다. 건물번호(본번·부번)는 항상 같아야 하고, 도로명코드는 아래 순서로 본다.
+ *
+ * 1. 도로명코드(시군구코드 5 + 도로명번호 7)가 같다.
+ * 2. 도로명번호만 같다. 행정구역 개편으로 시군구코드만 바뀐 경우다(화성시 4개 구 신설, 인천 영종·검단구 신설,
+ *    전남광주통합특별시). 원본은 옛 시군구코드를 그대로 갖고 있다.
+ * 3. 시군구코드가 같고 도로명번호만 다르다. 같은 도로명에 도로명번호가 새로 매겨진 경우다(의정부·양주 평화로 등).
+ *
+ * 2·3은 결과의 도로명(rn)이 검색어에 낱말로 들어 있을 때만 받는다. 시군구 안에서 도로명 + 건물번호는 하나뿐이다.
+ * 각 단계에서 지하여부까지 같은 결과를 먼저 고르고, 지하여부만 다르면 허용한다.
+ */
+export function pickSameBuilding(results, key, keyword = "") {
+  const words = new Set(String(keyword).split(" "));
+  const sameNumber = (item) =>
+    String(Number(digits(item?.buldMnnm))) === key.buldMnnm
     && String(Number(digits(item?.buldSlno) || "0")) === key.buldSlno;
-  return results.find((item) => same(item) && digits(item?.udrtYn) === key.udrtYn)
-    ?? results.find(same)
-    ?? null;
+  const roadNamed = (item) => words.has(digits(item?.rn));
+  const sggOf = (code) => code.slice(0, 5);
+  const roadOf = (code) => code.slice(5);
+  const tiers = [
+    (code) => code === key.rnMgtSn,
+    (code, item) => roadOf(code) === roadOf(key.rnMgtSn) && roadNamed(item),
+    (code, item) => sggOf(code) === sggOf(key.rnMgtSn) && roadNamed(item)
+  ];
+  for (const tier of tiers) {
+    const candidates = results.filter((item) => sameNumber(item) && tier(digits(item?.rnMgtSn), item));
+    const match = candidates.find((item) => digits(item?.udrtYn) === key.udrtYn) ?? candidates[0];
+    if (match) {
+      return match;
+    }
+  }
+  return null;
 }
 
 export function roundCoordinate(value) {
